@@ -24,11 +24,6 @@ Parameters:
     Default: ECR_PUBLIC
     AllowedValues: [ECR, ECR_PUBLIC]
     Description: Where the image lives. ECR_PUBLIC needs no access role.
-  DbPassword:
-    Type: String
-    NoEcho: true
-    MinLength: 12
-    Description: Postgres administrator password.
   DbInstanceClass:
     Type: String
     Default: db.t4g.micro
@@ -164,12 +159,29 @@ Resources:
           ToPort: 5432
           SourceSecurityGroupId: !Ref AppSecurityGroup
 
+  # ---- Database password ----------------------------------------------------------
+  # Generated and held by Secrets Manager: never a CLI argument, never a stack parameter,
+  # never printed by the installer, and never visible in CloudFormation's console.
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${NamePrefix}/db-password'
+      Description: Hetu database password, generated and held by Secrets Manager
+      GenerateSecretString:
+        PasswordLength: 40
+        # RDS rejects '/', '@', '"' and space in a master password; excluding punctuation
+        # entirely also keeps the value safe to drop into a JDBC URL.
+        ExcludePunctuation: true
+
   # ---- Database -------------------------------------------------------------------
   # Saved policy drafts live here — the operator's own work, which Hetu cannot regenerate.
   # Everything else it shows is derived from the account plus the catalog baked into the image.
   Database:
     Type: AWS::RDS::DBInstance
-    DeletionPolicy: Delete
+    # Snapshot rather than Delete: the saved drafts are the operator's own work, and a
+    # tear-down should not be the thing that loses them.
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
     Properties:
       DBInstanceIdentifier: !Sub '${NamePrefix}-db'
       Engine: postgres
@@ -177,9 +189,10 @@ Resources:
       DBInstanceClass: !Ref DbInstanceClass
       AllocatedStorage: '20'
       StorageType: gp3
+      StorageEncrypted: true
       DBName: hetu
       MasterUsername: hetuadmin
-      MasterUserPassword: !Ref DbPassword
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString}}'
       DBSubnetGroupName: !Ref DbSubnetGroup
       VPCSecurityGroups: [!GetAtt DbSecurityGroup.GroupId]
       PubliclyAccessible: false
@@ -222,12 +235,17 @@ Resources:
   # data, so the grants below stop at policy documents.
   #
   # Two exclusions are the point of writing this by hand rather than reaching for a managed
-  # policy: secretsmanager:GetResourcePolicy is granted but GetSecretValue is not, and
-  # s3:GetBucketPolicy is granted but GetObject is not. Hetu can tell you who could read
-  # a secret; it cannot read the secret.
+  # policy: on *your* secrets Hetu holds secretsmanager:GetResourcePolicy and not
+  # GetSecretValue, and on S3 it holds GetBucketPolicy and not GetObject. Hetu can tell you
+  # who could read a secret; it cannot read the secret.
+  #
+  # The one GetSecretValue below is scoped by ARN to Hetu's own database password and nothing
+  # else — App Runner resolves it through this role at start. Read the Resource line: it names
+  # a single secret this stack created, not a wildcard.
   InstanceRole:
     Type: AWS::IAM::Role
     Properties:
+      RoleName: !Sub '${NamePrefix}-instance-role'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -266,6 +284,11 @@ Resources:
                 Resource: '*'
               # Resource-based policies. Every one of these is a *Policy or *Attributes
               # read; none of them returns the contents of the resource.
+              # App Runner resolves HETU_DB_PASSWORD through this role.
+              - Sid: ReadOwnDatabaseSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DbSecret
               - Sid: ReadResourcePolicies
                 Effect: Allow
                 Action:
@@ -325,10 +348,17 @@ Resources:
           ImageRepositoryType: !Ref ImageRepositoryType
           ImageConfiguration:
             Port: '8080'
+            # App Runner resolves this from Secrets Manager at start; the value never
+            # passes through CloudFormation, the installer, or a shell history.
+            RuntimeEnvironmentSecrets:
+              - { Name: HETU_DB_PASSWORD, Value: !Ref DbSecret }
             RuntimeEnvironmentVariables:
+              # tenant = the full in-account product. The hosted playground runs the same
+              # image with HETU_MODE=saas, which has no database and stores nothing.
+              - { Name: HETU_MODE, Value: tenant }
+              - { Name: HETU_ROLE_NAME, Value: !Sub '${NamePrefix}-instance-role' }
               - { Name: HETU_DB_URL, Value: !Sub 'jdbc:postgresql://${Database.Endpoint.Address}:5432/hetu' }
               - { Name: HETU_DB_USER, Value: hetuadmin }
-              - { Name: HETU_DB_PASSWORD, Value: !Ref DbPassword }
               - { Name: HETU_OIDC_ISSUER, Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}' }
               - { Name: HETU_OIDC_CLIENT_ID, Value: !Ref UserPoolClient }
               # The Cognito app client is confidential (GenerateSecret: true), so the server-side
@@ -361,3 +391,6 @@ Outputs:
     Value: !Sub 'https://${NamePrefix}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com'
   DatabaseEndpoint:
     Value: !GetAtt Database.Endpoint.Address
+  InstanceRoleName:
+    Description: The read-only role Hetu runs as
+    Value: !Ref InstanceRole
