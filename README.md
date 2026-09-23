@@ -77,4 +77,5 @@ that" is wrong in exactly the cases that matter. So the product runs where the d
 ## Status
 
 Pre-release: `version.json` reads `0.0.0` because no container image has been published yet.
-Until a release runs, `install-aws.sh` has no image to deploy.
+Until a release runs, `install.sh` falls back to `:latest` (with a warning) and has no image
+to deploy.
